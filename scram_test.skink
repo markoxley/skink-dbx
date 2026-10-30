@@ -1,0 +1,104 @@
+// File:    scram_test.skink
+// Purpose: Unit tests for dbx_scram — RFC 7677 SCRAM-SHA-256 test
+//          vectors (password "pencil"), the SHA-1 mechanism against
+//          independently computed digests, nonce validation, and
+//          server-final verification.
+module scram_test
+
+import "dbx_scram"
+import "std/str"
+import "std/testing"
+
+const rfcNonce = "rOprNGfwEbeRWgbNEkqO"
+const rfcServerFirst = "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096"
+
+// TestSha256Vector runs the RFC 7677 example end to end: pinned client
+// nonce, fixed salt/iterations, expected client-final proof and server
+// signature.
+pub fn TestSha256Vector() {
+    s := dbx_scram.NewScram("user", "pencil", true)
+    s.Nonce = rfcNonce
+    first := dbx_scram.ClientFirst(&s)
+    testing.AssertEqualString("n,,n=user,r=rOprNGfwEbeRWgbNEkqO", first, "client-first message")
+    final, err := dbx_scram.HandleServerFirst(&s, rfcServerFirst)
+    testing.AssertEqualString("", err.message, "server-first handled")
+    testing.AssertEqualString(
+        "c=biws,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,p=dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ=",
+        final, "client-final matches RFC 7677")
+    verr := dbx_scram.VerifyServerFinal(&s, "v=6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=")
+    testing.AssertEqualString("", verr.message, "server signature verified")
+}
+
+// TestSha1Vector exercises SCRAM-SHA-1; expected proof/signature were
+// computed independently with PBKDF2-HMAC-SHA1.
+pub fn TestSha1Vector() {
+    s := dbx_scram.NewScram("user", "pencil", false)
+    s.Nonce = rfcNonce
+    dbx_scram.ClientFirst(&s)
+    final, err := dbx_scram.HandleServerFirst(&s, rfcServerFirst)
+    testing.AssertEqualString("", err.message, "server-first handled")
+    testing.AssertEqualString(
+        "c=biws,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,p=NxII6noLm3UpyIjcNk1DjtdZIIQ=",
+        final, "sha1 client-final proof")
+    verr := dbx_scram.VerifyServerFinal(&s, "v=Tq1dKKdFondzApGMADAzcCNmCr4=")
+    testing.AssertEqualString("", verr.message, "sha1 server signature")
+}
+
+// TestBadNonceRejection: a server nonce not extending ours is an error.
+pub fn TestBadNonceRejection() {
+    s := dbx_scram.NewScram("user", "pencil", true)
+    s.Nonce = "abc"
+    dbx_scram.ClientFirst(&s)
+    _, err := dbx_scram.HandleServerFirst(&s, "r=zzz,s=AAAA,i=4096")
+    testing.AssertTrue(str.Len(err.message) > 0, "foreign nonce rejected")
+}
+
+// TestBadServerFinal: wrong signature fails verification.
+pub fn TestBadServerFinal() {
+    s := dbx_scram.NewScram("user", "pencil", true)
+    s.Nonce = rfcNonce
+    dbx_scram.ClientFirst(&s)
+    dbx_scram.HandleServerFirst(&s, rfcServerFirst)
+    err := dbx_scram.VerifyServerFinal(&s, "v=AAAAbbbbCCCCddddEEEEffffGGGghhhhIIIIjjjjKKk=")
+    testing.AssertTrue(str.Len(err.message) > 0, "forged signature rejected")
+    // e= form surfaces the server's own error string.
+    err2 := dbx_scram.VerifyServerFinal(&s, "e=invalid-proof")
+    testing.AssertTrue(str.Contains(err2.message, "invalid-proof"), "e= error propagated")
+}
+
+// TestNonceEchoRejected — regression: a server-first whose r= is
+// exactly the client nonce (no server-appended suffix) must be
+// rejected; RFC 5802 requires the server to extend the nonce.
+pub fn TestNonceEchoRejected() {
+    s := dbx_scram.NewScram("user", "pencil", true)
+    s.Nonce = rfcNonce
+    dbx_scram.ClientFirst(&s)
+    _, err := dbx_scram.HandleServerFirst(&s,
+        "r=rOprNGfwEbeRWgbNEkqO,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096")
+    testing.AssertTrue(str.Len(err.message) > 0, "bare nonce echo rejected")
+}
+
+// TestItersOverflowRejected — regression: an iteration count wider than
+// 7 digits would wrap the i32 accumulator and is also an absurd PBKDF2
+// workload (a hostile server could force ~10^9 hashes).
+pub fn TestItersOverflowRejected() {
+    s := dbx_scram.NewScram("user", "pencil", true)
+    s.Nonce = rfcNonce
+    dbx_scram.ClientFirst(&s)
+    _, err := dbx_scram.HandleServerFirst(&s,
+        "r=rOprNGfwEbeRWgbNEkqOextra,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=12345678")
+    testing.AssertTrue(str.Len(err.message) > 0, "oversized iters rejected")
+}
+
+// TestShortServerSignature — regression: a v= signature shorter than
+// the hash length must fail BEFORE the fixed-length compare reads
+// past the decoded buffer.
+pub fn TestShortServerSignature() {
+    s := dbx_scram.NewScram("user", "pencil", true)
+    s.Nonce = rfcNonce
+    dbx_scram.ClientFirst(&s)
+    _, err := dbx_scram.HandleServerFirst(&s, rfcServerFirst)
+    testing.AssertEqualString("", err.message, "server-first handled")
+    verr := dbx_scram.VerifyServerFinal(&s, "v=AAAA")
+    testing.AssertTrue(str.Len(verr.message) > 0, "short signature rejected")
+}

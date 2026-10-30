@@ -1,0 +1,70 @@
+// File:    rows_test.skink
+// Purpose: Unit tests for dbx_rows — the eager result-set model:
+//          iteration, named-column lookup, convenience coercions, and
+//          cursor boundary behaviour.
+module rows_test
+
+import "dbx_rows"
+import "dbx_value"
+import "std/testing"
+
+// fixtureRows builds a two-row, three-column result set.
+fn fixtureRows() -> dbx_rows.Rows {
+    var cols []string
+    cols = append(cols, "id")
+    cols = append(cols, "name")
+    cols = append(cols, "score")
+    var data [][]dbx_value.Value
+    var r1 []dbx_value.Value
+    r1 = append(r1, dbx_value.Int(1))
+    r1 = append(r1, dbx_value.Text("alpha"))
+    r1 = append(r1, dbx_value.Float(9.5))
+    var r2 []dbx_value.Value
+    r2 = append(r2, dbx_value.Int(2))
+    r2 = append(r2, dbx_value.Text("beta"))
+    r2 = append(r2, dbx_value.Null())
+    data = append(data, r1)
+    data = append(data, r2)
+    return dbx_rows.NewRows(cols, data)
+}
+
+// TestIteration walks the cursor through both rows and off the end.
+pub fn TestIteration() {
+    rows := fixtureRows()
+    testing.AssertEqualInt(2, rows.Count(), "two rows")
+    testing.AssertTrue(rows.Next(), "first Next")
+    testing.AssertTrue(rows.Get(0).I64 == 1, "row1 id")
+    testing.AssertEqualString("alpha", rows.String("name"), "row1 name")
+    testing.AssertTrue(rows.Next(), "second Next")
+    testing.AssertTrue(rows.Get(0).I64 == 2, "row2 id")
+    testing.AssertTrue(dbx_value.IsNull(rows.Get(2)), "row2 null score")
+    testing.AssertTrue(!rows.Next(), "cursor off the end")
+    testing.AssertTrue(!rows.Next(), "Next stays false")
+}
+
+// TestByName covers named-column access and missing columns.
+pub fn TestByName() {
+    rows := fixtureRows()
+    rows.Next()
+    v, ok := rows.ByName("score")
+    testing.AssertTrue(ok, "score found")
+    testing.AssertTrue(v.F64 > 9.4 && v.F64 < 9.6, "score value")
+    _, missing := rows.ByName("nope")
+    testing.AssertTrue(!missing, "missing column reports false")
+    testing.AssertEqualInt(-1, rows.ColumnIndex("nope"), "missing index -1")
+    testing.AssertTrue(rows.Int64("id") == 1, "Int64 convenience")
+}
+
+// TestResetAndBounds covers Reset and out-of-range safety.
+pub fn TestResetAndBounds() {
+    rows := fixtureRows()
+    rows.Next()
+    rows.Next()
+    rows.Reset()
+    testing.AssertTrue(rows.Next(), "rewound to row1")
+    testing.AssertTrue(rows.Get(0).I64 == 1, "row1 again")
+    // Out-of-range reads yield NULL rather than crashing.
+    testing.AssertTrue(dbx_value.IsNull(rows.Get(99)), "oob column is null")
+    rows.Close()
+    testing.AssertTrue(!rows.Next(), "closed cursor stops")
+}

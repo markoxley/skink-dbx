@@ -1,0 +1,48 @@
+// File:    dbx.skink
+// Purpose: Root module for skink-dbx — the shared database driver
+//          toolkit. Re-exports the driver/connection abstraction, the
+//          Value/Rows data model, DSN parsing, the buffered transport,
+//          SCRAM authentication, and the connection pool so consumers
+//          need only `import "dbx"`.
+//
+//          Wire-protocol drivers (skink-postgres, skink-mysql, ...) each
+//          import the dbx_* modules directly and register a Driver with
+//          dbx_driver.RegisterDriver; applications then call
+//          dbx.Open("postgres://...") / dbx_pool.OpenPool(...).
+module dbx
+
+import "dbx_dsn"
+import "dbx_value"
+import "dbx_rows"
+import "dbx_driver"
+import "dbx_bufconn"
+import "dbx_scram"
+import "dbx_pool"
+import "std/errors"
+
+// Re-exported types so applications can name them as dbx.X.
+pub type ConnInfo = dbx_dsn.ConnInfo
+pub type Value = dbx_value.Value
+pub type Rows = dbx_rows.Rows
+pub type Conn = dbx_driver.Conn
+pub type Tx = dbx_driver.Tx
+pub type Driver = dbx_driver.Driver
+pub type BufConn = dbx_bufconn.BufConn
+pub type Scram = dbx_scram.Scram
+pub type Pool = dbx_pool.Pool
+
+// Open parses a DSN and opens a connection through the registered driver
+// for its scheme.
+pub fn Open(dsn: string) -> (Conn, errors.Error) {
+    return dbx_driver.Open(dsn)
+}
+
+// OpenPool creates a bounded connection pool for a DSN.
+pub fn OpenPool(dsn: string, maxOpen: int) -> (Pool, errors.Error) {
+    return dbx_pool.OpenPool(dsn, maxOpen)
+}
+
+// RegisterDriver makes a driver available under its scheme name.
+pub fn RegisterDriver(d: Driver) {
+    dbx_driver.RegisterDriver(d)
+}

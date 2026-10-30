@@ -1,0 +1,261 @@
+// File:    bufconn.skink
+// Purpose: Buffered bidirectional transport for dbx wire protocols.
+//          BufConn wraps a net.Connection (TCP) with a small read-side
+//          buffer so drivers can do exact-length reads (ReadN), line
+//          reads (ReadUntil), and single-byte peeks without syscall
+//          churn. StartTLS upgrades the socket in place to TLS — after
+//          the upgrade all I/O flows through OpenSSL instead of the raw
+//          fd, which is what postgres/mysql/sqlserver require for
+//          sslmode=require / encrypted sessions.
+module dbx_bufconn
+
+import "std/str"
+import "std/libc"
+import "std/net"
+import "std/errors"
+
+// TLS client primitives — same externs std/api uses.
+extern fn Skink_tls_client_connect_ex(fd: int, hostname: string, port: int, verify: int) -> int64
+extern fn Skink_tls_read(ssl: int64, buf: string, len: int) -> int
+extern fn Skink_tls_write_all(ssl: int64, buf: string, len: int) -> int
+extern fn Skink_tls_close(ssl: int64)
+
+// memmove is required (not memcpy) for the in-buffer consume shifts —
+// source and destination overlap there and memcpy is UB on overlap.
+// std/libc doesn't export it, so declare it here.
+extern fn memmove(dest: string, src: string, n: int64) -> string
+
+const bufChunk = 16384
+
+// BufConn is a buffered socket. pend/pendLen/pendCap describe the
+// read-side staging area: pend[0..pendLen) holds bytes received but not
+// yet consumed by the driver.
+pub struct BufConn {
+    conn:    net.Connection // underlying TCP socket
+    ssl:     int64          // OpenSSL session after StartTLS (0 = plain)
+    host:    string         // peer hostname (kept for TLS SNI)
+    port:    int            // peer port
+    pend:    string         // staging buffer
+    pendLen: int            // valid bytes in pend
+    pendCap: int            // allocated capacity of pend
+    open:    bool
+
+    // Host returns the peer hostname this connection dialed.
+    pub fn Host(self: *BufConn) -> string {
+        return self.host
+    }
+
+    // IsTLS reports whether the connection has been upgraded to TLS.
+    pub fn IsTLS(self: *BufConn) -> bool {
+        return self.ssl != int64(0)
+    }
+
+    // SetTimeout applies a receive/send deadline in milliseconds on the
+    // underlying socket (0 = block forever). Reads that hit the deadline
+    // surface as errors; buffered state is preserved so a later read can
+    // still consume partially-arrived frames.
+    pub fn SetTimeout(self: *BufConn, timeoutMs: int) {
+        self.conn.SetTimeout(timeoutMs)
+    }
+
+    // readRaw performs one underlying read into buf, TLS-aware.
+    fn readRaw(self: *BufConn, buf: string, n: int) -> int {
+        if self.ssl != int64(0) {
+            return Skink_tls_read(self.ssl, buf, n)
+        }
+        return self.conn.Read(buf, n)
+    }
+
+    // ensure grows the staging buffer until at least need bytes are
+    // pending, reading from the socket as required.
+    fn ensure(self: *BufConn, need: int) -> errors.Error {
+        for self.pendLen < need {
+            // Grow the staging buffer when a single fill would overflow.
+            if self.pendLen + bufChunk > self.pendCap {
+                newCap := self.pendCap * 2
+                if newCap < self.pendLen + bufChunk {
+                    newCap = self.pendLen + bufChunk
+                }
+                if newCap < 4096 {
+                    newCap = 4096
+                }
+                nb := libc.malloc(newCap)
+                if self.pendLen > 0 {
+                    libc.memcpy(nb, self.pend, self.pendLen)
+                }
+                if self.pendCap > 0 {
+                    libc.free(self.pend)
+                }
+                self.pend = nb
+                self.pendCap = newCap
+            }
+            n := self.readRaw(string(int64(self.pend) + int64(self.pendLen)), bufChunk)
+            if n <= 0 {
+                return errors.New("dbx: connection closed by peer")
+            }
+            self.pendLen = self.pendLen + n
+        }
+        return errors.New("")
+    }
+
+    // ReadN consumes exactly n bytes; fewer means the peer hung up.
+    pub fn ReadN(self: *BufConn, n: int) -> (string, errors.Error) {
+        if n < 0 {
+            return "", errors.New("dbx: negative read length")
+        }
+        err := self.ensure(n)
+        if str.Len(err.message) > 0 {
+            return "", err
+        }
+        out := libc.malloc(n + 1)
+        libc.memcpy(out, self.pend, n)
+        out[n] = 0
+        // Consume by memmove so the staging buffer stays prefix-packed.
+        rest := self.pendLen - n
+        if rest > 0 {
+            memmove(self.pend, string(int64(self.pend) + int64(n)), int64(rest))
+        }
+        self.pendLen = rest
+        return out, errors.New("")
+    }
+
+    // PeekN returns the next n bytes without consuming them.
+    pub fn PeekN(self: *BufConn, n: int) -> (string, errors.Error) {
+        if n < 0 {
+            return "", errors.New("dbx: negative read length")
+        }
+        err := self.ensure(n)
+        if str.Len(err.message) > 0 {
+            return "", err
+        }
+        out := libc.malloc(n + 1)
+        libc.memcpy(out, self.pend, n)
+        out[n] = 0
+        return out, errors.New("")
+    }
+
+    // ReadByte consumes one byte and returns it as an int.
+    pub fn ReadByte(self: *BufConn) -> (int, errors.Error) {
+        err := self.ensure(1)
+        if str.Len(err.message) > 0 {
+            return 0, err
+        }
+        c := self.pend[0]
+        self.pendLen = self.pendLen - 1
+        if self.pendLen > 0 {
+            memmove(self.pend, string(int64(self.pend) + 1), int64(self.pendLen))
+        }
+        if c < 0 {
+            return c + 256, errors.New("")
+        }
+        return c, errors.New("")
+    }
+
+    // ReadUntil consumes bytes through the first delim byte and returns
+    // everything up to (excluding) it.
+    pub fn ReadUntil(self: *BufConn, delim: int) -> (string, errors.Error) {
+        for {
+            i := 0
+            found := -1
+            for i < self.pendLen {
+                c := self.pend[i]
+                if c < 0 {
+                    c = c + 256
+                }
+                if c == delim {
+                    found = i
+                    break
+                }
+                i = i + 1
+            }
+            if found >= 0 {
+                out := libc.malloc(found + 1)
+                if found > 0 {
+                    libc.memcpy(out, self.pend, found)
+                }
+                out[found] = 0
+                rest := self.pendLen - found - 1
+                if rest > 0 {
+                    memmove(self.pend, string(int64(self.pend) + int64(found) + 1), int64(rest))
+                }
+                self.pendLen = rest
+                return out, errors.New("")
+            }
+            err := self.ensure(self.pendLen + 1)
+            if str.Len(err.message) > 0 {
+                return "", err
+            }
+        }
+        return "", errors.New("unreachable")
+    }
+
+    // WriteAll sends every byte of data[0..n) — TLS-aware.
+    pub fn WriteAll(self: *BufConn, data: string, n: int) -> errors.Error {
+        if self.ssl != int64(0) {
+            rc := Skink_tls_write_all(self.ssl, data, n)
+            if rc != 0 {
+                return errors.New("dbx: TLS write failed")
+            }
+            return errors.New("")
+        }
+        sent := self.conn.SendAll(data, n)
+        if sent != n {
+            return errors.New("dbx: socket write failed")
+        }
+        return errors.New("")
+    }
+
+    // StartTLS performs a client TLS handshake over the existing socket.
+    // After it succeeds, all I/O is encrypted. verify=1 enables
+    // certificate verification against the system trust store.
+    pub fn StartTLS(self: *BufConn, verify: bool) -> errors.Error {
+        if self.ssl != int64(0) {
+            return errors.New("dbx: TLS already active")
+        }
+        v := 0
+        if verify {
+            v = 1
+        }
+        ssl := Skink_tls_client_connect_ex(self.conn.fd, self.host, self.port, v)
+        if ssl == int64(0) {
+            return errors.New("dbx: TLS handshake failed")
+        }
+        self.ssl = ssl
+        self.pendLen = 0 // any plaintext leftover must not leak into TLS reads
+        return errors.New("")
+    }
+
+    // Close tears down TLS (if active) then the socket. Idempotent.
+    pub fn Close(self: *BufConn) {
+        if !self.open {
+            return
+        }
+        self.open = false
+        if self.ssl != int64(0) {
+            Skink_tls_close(self.ssl)
+            self.ssl = int64(0)
+        }
+        self.conn.Close()
+        if self.pendCap > 0 {
+            libc.free(self.pend)
+            self.pend = ""
+            self.pendCap = 0
+            self.pendLen = 0
+        }
+    }
+}
+
+// Dial opens a TCP connection to host:port with the given millisecond
+// connect timeout (0 = block).
+pub fn Dial(host: string, port: int, timeoutMs: int) -> (BufConn, errors.Error) {
+    conn, err := net.ConnectWithTimeout(host, port, timeoutMs)
+    if str.Len(err.message) > 0 {
+        return BufConn{}, err
+    }
+    return BufConn{conn: conn, ssl: int64(0), host: host, port: port, open: true}, errors.New("")
+}
+
+// Wrap adopts an already-connected socket into a BufConn.
+pub fn Wrap(conn: net.Connection, host: string, port: int) -> BufConn {
+    return BufConn{conn: conn, ssl: int64(0), host: host, port: port, open: true}
+}

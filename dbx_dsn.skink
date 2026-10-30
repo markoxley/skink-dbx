@@ -1,0 +1,201 @@
+// File:    dsn.skink
+// Purpose: Connection-string (DSN) parsing for dbx drivers. Parses
+//          URLs of the form
+//
+//              scheme://user:password@host:port/database?k=v&k=v
+//
+//          into a ConnInfo struct. Percent-encoding in the userinfo and
+//          database path is decoded; query parameters are collected into
+//          a map so each driver can pick out the options it understands
+//          (e.g. sslmode for postgres, tls for mysql, encrypt for mssql).
+module dbx_dsn
+
+import "std/str"
+import "std/strconv"
+import "std/errors"
+
+// ConnInfo is a parsed connection string.
+pub struct ConnInfo {
+    Scheme:   string              // e.g. "postgres", "mysql", "mongodb"
+    User:     string              // decoded username ("" when absent)
+    Password: string              // decoded password ("" when absent)
+    Host:     string              // hostname or IP ("localhost" default)
+    Port:     int                 // port number (0 = driver default)
+    Database: string              // database / keyspace / db index
+    Params:   map[string]string   // query parameters
+    Raw:      string              // the original DSN text
+}
+
+// PortOr returns the configured port, or fallback when unset/zero.
+pub fn PortOr(info: ConnInfo, fallback: int) -> int {
+    if info.Port > 0 {
+        return info.Port
+    }
+    return fallback
+}
+
+// Param returns the query parameter value and true when present.
+pub fn Param(info: ConnInfo, key: string) -> (string, bool) {
+    v, ok := info.Params[key]
+    return v, ok
+}
+
+// ParamOr returns the query parameter value or fallback when absent.
+pub fn ParamOr(info: ConnInfo, key: string, fallback: string) -> string {
+    v, ok := info.Params[key]
+    if ok {
+        return v
+    }
+    return fallback
+}
+
+// hexVal converts one hex digit to its value, or -1 when invalid.
+fn hexVal(c: int) -> int {
+    if c >= 48 && c <= 57 { return c - 48 }          // '0'-'9'
+    if c >= 97 && c <= 102 { return c - 97 + 10 }    // 'a'-'f'
+    if c >= 65 && c <= 70 { return c - 65 + 10 }     // 'A'-'F'
+    return -1
+}
+
+// pctDecode decodes %XX percent-escapes and '+' (query-component
+// convention — a plus in userinfo stays literal per RFC 3986, but the
+// query side treats it as space; decodePlus selects the behaviour).
+fn pctDecode(s: string, decodePlus: bool) -> string {
+    if !str.Contains(s, "%") && !(decodePlus && str.Contains(s, "+")) {
+        return s
+    }
+    b := str.NewBuilder(str.Len(s))
+    n := str.Len(s)
+    i := 0
+    for i < n {
+        c := s[i]
+        if c == 37 && i + 2 < n { // '%'
+            hi := hexVal(s[i + 1])
+            lo := hexVal(s[i + 2])
+            if hi >= 0 && lo >= 0 {
+                b.WriteByte(hi * 16 + lo)
+                i = i + 3
+                continue
+            }
+        }
+        if decodePlus && c == 43 { // '+'
+            b.WriteByte(32)
+            i = i + 1
+            continue
+        }
+        b.WriteByte(c)
+        i = i + 1
+    }
+    out := b.String()
+    b.Free()
+    return out
+}
+
+// splitOnce splits s on the first occurrence of sep. Returns the part
+// before, the part after, and whether the separator was found.
+fn splitOnce(s: string, sep: string) -> (string, string, bool) {
+    idx := str.IndexOf(s, sep)
+    if idx < 0 {
+        return s, "", false
+    }
+    return str.Substr(s, 0, idx), str.Substr(s, idx + str.Len(sep), str.Len(s) - idx - str.Len(sep)), true
+}
+
+// parseParams fills Params from a query string like "a=1&b=2".
+fn parseParams(info: *ConnInfo, q: string) {
+    info.Params = make(map[string]string)
+    if str.Len(q) == 0 {
+        return
+    }
+    pairs := str.Split(q, "&")
+    for i := 0; i < len(pairs); i = i + 1 {
+        k, v, found := splitOnce(pairs[i], "=")
+        if !found {
+            v = ""
+        }
+        info.Params[pctDecode(k, true)] = pctDecode(v, true)
+    }
+}
+
+// ParseDSN parses a database URL into a ConnInfo. The scheme selects the
+// driver family ("postgres", "postgresql", "mysql", "mariadb", "mssql",
+// "sqlserver", "mongodb", "mongodb+srv" (rejected — no DNS SRV lookup),
+// "redis", "rediss"). An error is returned for malformed input.
+pub fn ParseDSN(dsn: string) -> (ConnInfo, errors.Error) {
+    info := ConnInfo{Port: 0, Host: "localhost", Raw: dsn}
+    rest, after, hasScheme := splitOnce(dsn, "://")
+    if !hasScheme {
+        return info, errors.New(str.Concat("dsn: missing scheme in ", dsn))
+    }
+    info.Scheme = str.ToLower(rest)
+    if str.Equal(info.Scheme, "mongodb+srv") {
+        return info, errors.New("dsn: mongodb+srv requires DNS SRV resolution which is not supported")
+    }
+    var body string
+    body = after
+
+    // Split off the query component first so '?' inside later fields
+    // cannot confuse the parse.
+    var query string
+    var hasQuery bool
+    body, query, hasQuery = splitOnce(body, "?")
+    if !hasQuery {
+        query = ""
+    }
+    parseParams(&info, query)
+
+    // userinfo@hostspec — the LAST '@' wins so passwords may contain '@'.
+    atIdx := str.LastIndexOf(body, "@")
+    var hostspec string
+    if atIdx >= 0 {
+        userinfo := str.Substr(body, 0, atIdx)
+        hostspec = str.Substr(body, atIdx + 1, str.Len(body) - atIdx - 1)
+        u, p, hasPass := splitOnce(userinfo, ":")
+        info.User = pctDecode(u, false)
+        if hasPass {
+            info.Password = pctDecode(p, false)
+        }
+    } else {
+        hostspec = body
+    }
+
+    // hostspec[/database]
+    var dbpart string
+    var hasDb bool
+    hostspec, dbpart, hasDb = splitOnce(hostspec, "/")
+    if hasDb {
+        info.Database = pctDecode(dbpart, false)
+    }
+
+    // host[:port] — IPv6 literals in brackets keep their colons.
+    if str.StartsWith(hostspec, "[") {
+        closeIdx := str.IndexOf(hostspec, "]")
+        if closeIdx < 0 {
+            return info, errors.New(str.Concat("dsn: unterminated IPv6 literal in ", dsn))
+        }
+        info.Host = str.Substr(hostspec, 1, closeIdx - 1)
+        rest := str.Substr(hostspec, closeIdx + 1, str.Len(hostspec) - closeIdx - 1)
+        if str.StartsWith(rest, ":") {
+            portStr := str.Substr(rest, 1, str.Len(rest) - 1)
+            port, ok := strconv.ParseInt(portStr)
+            if !ok || port <= 0 || port > 65535 {
+                return info, errors.New(str.Concat("dsn: invalid port in ", dsn))
+            }
+            info.Port = port
+        }
+    } else {
+        h, p, hasPort := splitOnce(hostspec, ":")
+        if hasPort {
+            port, ok := strconv.ParseInt(p)
+            if !ok || port <= 0 || port > 65535 {
+                return info, errors.New(str.Concat("dsn: invalid port in ", dsn))
+            }
+            info.Port = port
+            hostspec = h
+        }
+        if str.Len(hostspec) > 0 {
+            info.Host = hostspec
+        }
+    }
+    return info, errors.New("")
+}

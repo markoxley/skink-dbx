@@ -1,0 +1,117 @@
+// File:    bufconn_test.skink
+// Purpose: Unit tests for dbx_bufconn — the buffered wire transport.
+//          Spins up an in-process TCP echo server on 127.0.0.1 and
+//          verifies ReadN/ReadUntil/ReadByte/PeekN/WriteAll against it,
+//          including reads that span multiple TCP segments.
+module bufconn_test
+
+import "dbx_bufconn"
+import "std/str"
+import "std/net"
+import "std/time"
+import "std/errors"
+import "std/testing"
+
+var echoPort = 14631
+
+// echoServer accepts one connection and echoes everything it receives.
+fn echoServer(listener: net.Connection, wg: *waitgroup.WaitGroup) {
+    conn, err := net.Accept(listener)
+    if str.Len(err.message) > 0 {
+        waitgroup.Done(wg)
+        return
+    }
+    for i := 0; i < 4; i = i + 1 {
+        data, rerr := conn.Recv(8192)
+        if str.Len(rerr.message) > 0 {
+            break
+        }
+        conn.SendAll(data, str.Len(data))
+    }
+    conn.Close()
+    listener.Close()
+    waitgroup.Done(wg)
+}
+
+import "std/waitgroup"
+
+// TestReadPaths covers ReadN, ReadByte, ReadUntil and PeekN against the
+// echo server.
+pub fn TestReadPaths() {
+    listener, lerr := net.Listen("127.0.0.1", echoPort)
+    testing.AssertEqualString("", lerr.message, "listener up")
+    wg := waitgroup.New()
+    waitgroup.Add(wg, 1)
+    spawn echoServer(listener, wg)
+    time.SleepMs(50)
+
+    bc, err := dbx_bufconn.Dial("127.0.0.1", echoPort, 2000)
+    testing.AssertEqualString("", err.message, "dialed")
+    testing.AssertTrue(!bc.IsTLS(), "starts plaintext")
+
+    // WriteAll then ReadN: a 10-byte payload echoed back in full.
+    werr := bc.WriteAll("0123456789", 10)
+    testing.AssertEqualString("", werr.message, "write ok")
+    chunk, rerr := bc.ReadN(10)
+    testing.AssertEqualString("", rerr.message, "ReadN ok")
+    testing.AssertEqualString("0123456789", chunk, "ReadN payload")
+
+    // ReadUntil consumes through a delimiter; the byte before it is
+    // peeked first.
+    bc.WriteAll("head\r\nrest", 10)
+    pk, perr := bc.PeekN(2)
+    testing.AssertEqualString("", perr.message, "peek ok")
+    testing.AssertEqualString("he", pk, "peek does not consume")
+    line, lerr2 := bc.ReadUntil(10) // '\n'
+    testing.AssertEqualString("", lerr2.message, "ReadUntil ok")
+    testing.AssertEqualString("head\r", line, "line without delimiter")
+    b, berr := bc.ReadByte()
+    testing.AssertEqualString("", berr.message, "ReadByte ok")
+    testing.AssertEqualInt(114, b, "first byte of 'rest'") // 'r'
+    tail, terr := bc.ReadN(3)
+    testing.AssertEqualString("", terr.message, "tail ReadN")
+    testing.AssertEqualString("est", tail, "tail payload")
+
+    bc.Close()
+    waitgroup.Wait(wg)
+}
+
+// TestReadNTimeout: a read that can never complete reports EOF/timeout
+// rather than hanging forever once the socket deadline fires.
+pub fn TestReadNTimeout() {
+    listener, lerr := net.Listen("127.0.0.1", echoPort + 1)
+    testing.AssertEqualString("", lerr.message, "listener up")
+    wg := waitgroup.New()
+    waitgroup.Add(wg, 1)
+    spawn silentServer(listener, wg)
+    time.SleepMs(50)
+
+    bc, err := dbx_bufconn.Dial("127.0.0.1", echoPort + 1, 2000)
+    testing.AssertEqualString("", err.message, "dialed")
+    bc.conn.SetTimeout(200)
+    _, rerr := bc.ReadN(16)
+    testing.AssertTrue(str.Len(rerr.message) > 0, "timeout surfaces an error")
+    bc.Close()
+    listener.Close()
+    waitgroup.Wait(wg)
+}
+
+// silentServer accepts and holds the connection without replying.
+fn silentServer(listener: net.Connection, wg: *waitgroup.WaitGroup) {
+    conn, err := net.Accept(listener)
+    if str.Len(err.message) == 0 {
+        time.SleepMs(400)
+        conn.Close()
+    }
+    waitgroup.Done(wg)
+}
+
+// TestNegativeRead — regression: ReadN/PeekN with n<0 must error
+// before any I/O; previously they hit malloc(n+1)/memcpy(n).
+pub fn TestNegativeRead() {
+    bc := dbx_bufconn.BufConn{}
+    _, e1 := bc.ReadN(-1)
+    testing.AssertTrue(str.Len(e1.message) > 0, "ReadN(-1) rejected")
+    _, e2 := bc.PeekN(-4)
+    testing.AssertTrue(str.Len(e2.message) > 0, "PeekN(-4) rejected")
+}

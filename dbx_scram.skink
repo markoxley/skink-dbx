@@ -1,0 +1,316 @@
+// File:    scram.skink
+// Purpose: SCRAM-SHA-256 / SCRAM-SHA-1 client-side authentication
+//          (RFC 5802 / RFC 7677), shared by the PostgreSQL and MongoDB
+//          drivers. All hashing is done with explicit lengths so keys,
+//          salts, and digests may contain NUL bytes — the std/crypto
+//          convenience wrappers that measure with strlen are avoided on
+//          purpose.
+//
+//          Usage (per RFC three-step exchange):
+//              s := scram.New(user, pass, true)       // SHA-256
+//              first := scram.ClientFirst(&s)         // -> server
+//              final, err := scram.HandleServerFirst(&s, serverFirst)
+//              // send final, read server-final
+//              err = scram.VerifyServerFinal(&s, serverFinal)
+module dbx_scram
+
+import "std/str"
+import "std/libc"
+import "std/rand"
+import "std/base64"
+import "std/errors"
+
+extern fn SHA1(d: string, n: int64, md: string) -> string
+extern fn SHA256(d: string, n: int64, md: string) -> string
+
+// Mechanism names drivers advertise to the server.
+pub const MECH_SHA256 = "SCRAM-SHA-256"
+pub const MECH_SHA1   = "SCRAM-SHA-1"
+
+// hLen returns the digest size for the chosen mechanism.
+fn hLen(sha256: bool) -> int {
+    if sha256 {
+        return 32
+    }
+    return 20
+}
+
+// h computes the raw digest of data[0..n) with the selected hash.
+fn h(data: string, n: int, sha256: bool) -> string {
+    out := libc.malloc(hLen(sha256))
+    if sha256 {
+        SHA256(data, n, out)
+    } else {
+        SHA1(data, n, out)
+    }
+    return out
+}
+
+// hmac computes RFC 2104 HMAC over explicit-length key and message —
+// binary-safe for both SHA-1 and SHA-256.
+fn hmac(key: string, keyLen: int, msg: string, msgLen: int, sha256: bool) -> string {
+    block := 64
+    k := key
+    kl := keyLen
+    if kl > block {
+        k = h(k, kl, sha256)
+        kl = hLen(sha256)
+    }
+    ipad := libc.malloc(block + msgLen)
+    opad := libc.malloc(block + hLen(sha256))
+    libc.memset(ipad, 54, block) // 0x36
+    libc.memset(opad, 92, block) // 0x5c
+    for i := 0; i < kl; i = i + 1 {
+        ipad[i] = ipad[i] ^ k[i]
+        opad[i] = opad[i] ^ k[i]
+    }
+    libc.memcpy(string(int64(ipad) + int64(block)), msg, msgLen)
+    inner := h(ipad, block + msgLen, sha256)
+    libc.memcpy(string(int64(opad) + int64(block)), inner, hLen(sha256))
+    out := h(opad, block + hLen(sha256), sha256)
+    libc.free(ipad)
+    libc.free(opad)
+    libc.free(inner)
+    return out
+}
+
+// xorN returns a[0..n) ^ b[0..n) in a fresh buffer.
+fn xorN(a: string, b: string, n: int) -> string {
+    out := libc.malloc(n)
+    for i := 0; i < n; i = i + 1 {
+        out[i] = a[i] ^ b[i]
+    }
+    return out
+}
+
+// hi implements PBKDF2 with a single block (derived keys are always one
+// digest long in SCRAM): U1 = HMAC(pw, salt || 0x00000001), then
+// Ui = HMAC(pw, Ui-1) XOR-accumulated for iters rounds.
+fn hi(password: string, salt: string, saltLen: int, iters: int, sha256: bool) -> string {
+    dk := hLen(sha256)
+    msg := libc.malloc(saltLen + 4)
+    libc.memcpy(msg, salt, saltLen)
+    msg[saltLen] = 0
+    msg[saltLen + 1] = 0
+    msg[saltLen + 2] = 0
+    msg[saltLen + 3] = 1
+    u := hmac(password, str.Len(password), msg, saltLen + 4, sha256)
+    t := libc.malloc(dk)
+    libc.memcpy(t, u, dk)
+    for i := 1; i < iters; i = i + 1 {
+        next := hmac(password, str.Len(password), u, dk, sha256)
+        for j := 0; j < dk; j = j + 1 {
+            t[j] = t[j] ^ next[j]
+        }
+        libc.free(u)
+        u = next
+    }
+    libc.free(u)
+    libc.free(msg)
+    return t
+}
+
+// nonce builds a printable client nonce from rand output (no '=' or ','
+// so it can sit inside a SCRAM attribute list untouched).
+fn nonce() -> string {
+    b := str.NewBuilder(24)
+    chars := "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+    for i := 0; i < 24; i = i + 1 {
+        b.WriteByte(chars[rand.Int() % 64])
+    }
+    out := b.String()
+    b.Free()
+    return out
+}
+
+// Scram holds the client-side SCRAM exchange state.
+pub struct Scram {
+    Sha256:   bool   // mechanism selection (true = SCRAM-SHA-256)
+    User:     string // username sent in the n= attribute
+    Password: string // plaintext password (never sent on the wire)
+    Nonce:    string // client nonce — overwritten by the nonce generator
+                     // unless the caller presets it (tests pin this)
+
+    clientFirstBare: string // "n=...,r=..." — kept for the auth message
+    authMessage:     string // clientFirstBare,serverFirst,clientFinalBare
+    serverSig:       string // expected ServerSignature (raw digest bytes)
+    step:            int    // 0 = fresh, 1 = first sent, 2 = final sent
+}
+
+// NewScram creates a client for the given credentials. sha256 selects
+// SCRAM-SHA-256 (true, Postgres/modern Mongo) or SCRAM-SHA-1 (legacy
+// Mongo).
+pub fn NewScram(user: string, password: string, sha256: bool) -> Scram {
+    s := Scram{Sha256: sha256, User: user, Password: password}
+    s.Nonce = nonce()
+    return s
+}
+
+// Mechanism returns the wire mechanism name.
+pub fn Mechanism(s: *Scram) -> string {
+    if s.Sha256 {
+        return MECH_SHA256
+    }
+    return MECH_SHA1
+}
+
+// ClientFirst returns the client-first-message: gs2 header "n,," then
+// "n=<user>,r=<nonce>". '=' and ',' inside the username are escaped per
+// RFC 5802 (=2C / =3D).
+pub fn ClientFirst(s: *Scram) -> string {
+    safe := str.Replace(s.User, "=", "=3D")
+    safe = str.Replace(safe, ",", "=2C")
+    s.clientFirstBare = str.Concat("n=", str.Concat(safe, str.Concat(",r=", s.Nonce)))
+    s.step = 1
+    return str.Concat("n,,", s.clientFirstBare)
+}
+
+// parseAttrs splits a SCRAM message "k=v,k=v" into parallel key/value
+// slices.
+fn parseAttrs(msg: string) -> ([]string, []string) {
+    var keys []string
+    var vals []string
+    parts := str.Split(msg, ",")
+    for i := 0; i < len(parts); i = i + 1 {
+        eq := str.IndexOf(parts[i], "=")
+        if eq > 0 {
+            keys = append(keys, str.Substr(parts[i], 0, eq))
+            vals = append(vals, str.Substr(parts[i], eq + 1, str.Len(parts[i]) - eq - 1))
+        }
+    }
+    return keys, vals
+}
+
+// attrValue finds the value for key k in a parsed attribute list.
+fn attrValue(keys: []string, vals: []string, k: string) -> string {
+    for i := 0; i < len(keys); i = i + 1 {
+        if str.Equal(keys[i], k) {
+            return vals[i]
+        }
+    }
+    return ""
+}
+
+// HandleServerFirst consumes the server-first-message
+// ("r=<nonce>,s=<b64 salt>,i=<iters>") and returns the
+// client-final-message ("c=biws,r=<nonce>,p=<b64 proof>"). The full
+// nonce (client || server) is echoed back and checked to start with our
+// client nonce.
+pub fn HandleServerFirst(s: *Scram, msg: string) -> (string, errors.Error) {
+    if s.step != 1 {
+        return "", errors.New("scram: unexpected server-first before client-first")
+    }
+    keys, vals := parseAttrs(msg)
+    fullNonce := attrValue(keys, vals, "r")
+    saltB64 := attrValue(keys, vals, "s")
+    iterStr := attrValue(keys, vals, "i")
+    if str.Len(fullNonce) == 0 || str.Len(saltB64) == 0 || str.Len(iterStr) == 0 {
+        return "", errors.New("scram: malformed server-first-message")
+    }
+    if !str.StartsWith(fullNonce, s.Nonce) || str.Len(fullNonce) <= str.Len(s.Nonce) {
+        // RFC 5802: the server MUST append its own nonce characters —
+        // a bare echo of the client nonce is not a valid extension.
+        return "", errors.New("scram: server nonce does not extend client nonce")
+    }
+    salt, derr := base64.Decode(saltB64)
+    if str.Len(derr.message) > 0 {
+        return "", derr
+    }
+    // Reject over-long iteration strings up front: more than 7 digits
+    // would overflow an i32 accumulator and imply an absurd PBKDF2
+    // workload (a malicious server could otherwise force ~10^9 hashes).
+    if str.Len(iterStr) > 7 {
+        return "", errors.New("scram: iteration count out of range")
+    }
+    iters := 0
+    for i := 0; i < str.Len(iterStr); i = i + 1 {
+        c := iterStr[i]
+        if c < 48 || c > 57 {
+            return "", errors.New("scram: non-numeric iteration count")
+        }
+        iters = iters * 10 + (c - 48)
+    }
+    if iters <= 0 {
+        return "", errors.New("scram: invalid iteration count")
+    }
+    // base64.Decode stops at the first NUL so a salt containing NULs
+    // would be truncated; re-derive its true length from the base64
+    // text instead of strlen.
+    saltLen := (str.Len(saltB64) / 4) * 3
+    if str.EndsWith(saltB64, "==") {
+        saltLen = saltLen - 2
+    } else if str.EndsWith(saltB64, "=") {
+        saltLen = saltLen - 1
+    }
+
+    salted := hi(s.Password, salt, saltLen, iters, s.Sha256)
+    dk := hLen(s.Sha256)
+    clientKey := hmac(salted, dk, "Client Key", 10, s.Sha256)
+    storedKey := h(clientKey, dk, s.Sha256)
+
+    channelBinding := "c=biws" // "n,," base64'd — no TLS channel binding
+    // The auth message is clientFirstBare + "," + serverFirst + "," +
+    // clientFinalWithoutProof, where the final's attribute list is
+    // "c=biws,r=<fullNonce>" — omitting the r= breaks the signature.
+    finalPrefix := str.Concat(channelBinding, str.Concat(",r=", fullNonce))
+    s.authMessage = str.Concat(s.clientFirstBare,
+        str.Concat(",", str.Concat(msg, str.Concat(",", finalPrefix))))
+    clientProof := xorN(clientKey, hmac(storedKey, dk, s.authMessage, str.Len(s.authMessage), s.Sha256), dk)
+    proofB64 := base64.Encode(clientProof, dk)
+
+    serverKey := hmac(salted, dk, "Server Key", 10, s.Sha256)
+    s.serverSig = hmac(serverKey, dk, s.authMessage, str.Len(s.authMessage), s.Sha256)
+    s.step = 2
+    libc.free(salted)
+    libc.free(clientKey)
+    libc.free(storedKey)
+    libc.free(clientProof)
+    libc.free(serverKey)
+    return str.Concat(finalPrefix, str.Concat(",p=", proofB64)), errors.New("")
+}
+
+// VerifyServerFinal checks the server-final-message's v= signature
+// against the expected ServerSignature. Returns nil-error on match.
+pub fn VerifyServerFinal(s: *Scram, msg: string) -> errors.Error {
+    if s.step != 2 {
+        return errors.New("scram: unexpected server-final before client-final")
+    }
+    keys, vals := parseAttrs(msg)
+    sigB64 := attrValue(keys, vals, "v")
+    if str.Len(sigB64) == 0 {
+        // e= carries a server-side error (e.g. e=invalid-proof).
+        emsg := attrValue(keys, vals, "e")
+        if str.Len(emsg) > 0 {
+            return errors.New(str.Concat("scram: server error: ", emsg))
+        }
+        return errors.New("scram: malformed server-final-message")
+    }
+    sig, derr := base64.Decode(sigB64)
+    if str.Len(derr.message) > 0 {
+        return derr
+    }
+    dk := hLen(s.Sha256)
+    // base64.Decode's result is NUL-measured, so derive the true decoded
+    // length from the base64 text — a short/malformed signature must be
+    // rejected before the fixed-length compare reads past the buffer.
+    sigLen := (str.Len(sigB64) / 4) * 3
+    if str.EndsWith(sigB64, "==") {
+        sigLen = sigLen - 2
+    } else if str.EndsWith(sigB64, "=") {
+        sigLen = sigLen - 1
+    }
+    if sigLen != dk {
+        return errors.New("scram: server signature has wrong length")
+    }
+    ok := true
+    for i := 0; i < dk; i = i + 1 {
+        if sig[i] != s.serverSig[i] {
+            ok = false
+        }
+    }
+    if !ok {
+        return errors.New("scram: server signature mismatch")
+    }
+    s.step = 3
+    return errors.New("")
+}

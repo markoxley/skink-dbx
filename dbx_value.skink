@@ -1,0 +1,169 @@
+// File:    value.skink
+// Purpose: The dbx database Value model — a tagged union covering the
+//          scalar types every supported driver can produce or consume
+//          (NULL, signed integer, IEEE-754 double, text, binary blob,
+//          boolean, and timestamp-as-Unix-micros). Drivers translate
+//          between wire values and this model; the ORM and callers work
+//          only with Value, keeping them driver-agnostic.
+//
+//          Text and Blob payloads are carried in Str; Len records the
+//          explicit byte length so blobs may contain NUL bytes (Skink
+//          strings are otherwise C-NUL-terminated views).
+module dbx_value
+
+import "std/str"
+import "std/strconv"
+import "std/libc"
+
+// Kind tags for Value.
+pub const KIND_NULL  = 0
+pub const KIND_INT   = 1
+pub const KIND_FLOAT = 2
+pub const KIND_TEXT  = 3
+pub const KIND_BLOB  = 4
+pub const KIND_BOOL  = 5
+pub const KIND_TIME  = 6 // I64 holds Unix microseconds
+
+// Value is one database cell (or one bound parameter).
+pub struct Value {
+    Kind: int    // one of the KIND_* constants
+    I64:  int64  // integer payload / timestamp micros
+    F64:  float  // float payload
+    Bool: bool   // boolean payload
+    Str:  string // text/blob payload bytes
+    Len:  int    // explicit byte length of Str (binary-safe)
+}
+
+// Null constructs a NULL value.
+pub fn Null() -> Value {
+    return Value{Kind: KIND_NULL}
+}
+
+// Int constructs an integer value.
+pub fn Int(v: int64) -> Value {
+    return Value{Kind: KIND_INT, I64: v}
+}
+
+// Float constructs a floating-point value.
+pub fn Float(v: float) -> Value {
+    return Value{Kind: KIND_FLOAT, F64: v}
+}
+
+// Text constructs a text value (length measured with str.Len).
+pub fn Text(s: string) -> Value {
+    return Value{Kind: KIND_TEXT, Str: s, Len: str.Len(s)}
+}
+
+// TextN constructs a text value with an explicit byte length, for
+// payloads that may contain NUL bytes.
+pub fn TextN(s: string, n: int) -> Value {
+    return Value{Kind: KIND_TEXT, Str: s, Len: n}
+}
+
+// Blob constructs a binary value; s may contain NUL bytes and n is the
+// authoritative length.
+pub fn Blob(s: string, n: int) -> Value {
+    return Value{Kind: KIND_BLOB, Str: s, Len: n}
+}
+
+// Bool constructs a boolean value.
+pub fn Bool(v: bool) -> Value {
+    return Value{Kind: KIND_BOOL, Bool: v}
+}
+
+// TimeUnixMicros constructs a timestamp value from Unix microseconds.
+pub fn TimeUnixMicros(micros: int64) -> Value {
+    return Value{Kind: KIND_TIME, I64: micros}
+}
+
+// IsNull reports whether v is SQL NULL.
+pub fn IsNull(v: Value) -> bool {
+    return v.Kind == KIND_NULL
+}
+
+// Bytes returns the text/blob payload as a string (may contain NULs;
+// use v.Len for the authoritative length).
+pub fn Bytes(v: Value) -> string {
+    return v.Str
+}
+
+// dupLen copies exactly n bytes from s into a fresh NUL-terminated
+// buffer — binary-safe unlike str.Substr, which clamps by strlen.
+fn dupLen(s: string, n: int) -> string {
+    out := libc.malloc(n + 1)
+    if n > 0 {
+        libc.memcpy(out, s, n)
+    }
+    out[n] = 0
+    return out
+}
+
+// AsString renders any value as text (used by drivers that bind
+// parameters textually, e.g. the postgres simple protocol). Text and
+// blob payloads are copied out at exactly v.Len bytes.
+pub fn AsString(v: Value) -> string {
+    if v.Kind == KIND_NULL {
+        return "NULL"
+    }
+    if v.Kind == KIND_INT || v.Kind == KIND_TIME {
+        return strconv.Itoa64(v.I64)
+    }
+    if v.Kind == KIND_FLOAT {
+        return strconv.FormatFloat(v.F64, 17)
+    }
+    if v.Kind == KIND_BOOL {
+        if v.Bool {
+            return "true"
+        }
+        return "false"
+    }
+    return dupLen(v.Str, v.Len)
+}
+
+// AsInt64 coerces numeric/text/bool values to int64 (non-numeric → 0).
+pub fn AsInt64(v: Value) -> int64 {
+    if v.Kind == KIND_INT || v.Kind == KIND_TIME {
+        return v.I64
+    }
+    if v.Kind == KIND_FLOAT {
+        return int64(v.F64)
+    }
+    if v.Kind == KIND_BOOL {
+        if v.Bool {
+            return 1
+        }
+        return 0
+    }
+    n, ok := strconv.ParseInt64(dupLen(v.Str, v.Len))
+    if ok {
+        return n
+    }
+    return 0
+}
+
+// AsFloat coerces numeric/text values to float.
+pub fn AsFloat(v: Value) -> float {
+    if v.Kind == KIND_FLOAT {
+        return v.F64
+    }
+    if v.Kind == KIND_INT || v.Kind == KIND_TIME {
+        return float(v.I64)
+    }
+    f, ok := strconv.ParseFloat(dupLen(v.Str, v.Len))
+    if ok {
+        return f
+    }
+    return 0.0
+}
+
+// AsBool coerces bool/int/text values to bool.
+pub fn AsBool(v: Value) -> bool {
+    if v.Kind == KIND_BOOL {
+        return v.Bool
+    }
+    if v.Kind == KIND_INT {
+        return v.I64 != 0
+    }
+    s := str.ToLower(dupLen(v.Str, v.Len))
+    return str.Equal(s, "t") || str.Equal(s, "true") || str.Equal(s, "1") || str.Equal(s, "yes") || str.Equal(s, "on")
+}

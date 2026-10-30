@@ -1,0 +1,112 @@
+// File:    pool_test.skink
+// Purpose: Unit tests for dbx_pool — bounded acquire/release cycling,
+//          exhaustion blocking via the condition variable, bad-conn
+//          discard, and pool close semantics. Uses a registered fake
+//          driver so no real database is needed.
+module pool_test
+
+import "dbx_pool"
+import "dbx_driver"
+import "dbx_dsn"
+import "dbx_value"
+import "dbx_rows"
+import "std/str"
+import "std/sync"
+import "std/errors"
+import "std/time"
+import "std/testing"
+
+var pOpens = 0
+var pCloses = 0
+
+fn pQuery(c: *dbx_driver.Conn, sql: string, args: []dbx_value.Value) -> (dbx_rows.Rows, errors.Error) {
+    return dbx_rows.EmptyRows([]string{}), errors.New("")
+}
+fn pExec(c: *dbx_driver.Conn, sql: string, args: []dbx_value.Value) -> (int64, errors.Error) {
+    return 0, errors.New("")
+}
+fn pPing(c: *dbx_driver.Conn) -> errors.Error {
+    return errors.New("")
+}
+fn pBegin(c: *dbx_driver.Conn) -> (dbx_driver.Tx, errors.Error) {
+    return dbx_driver.Tx{}, errors.New("no tx")
+}
+fn pClose(c: *dbx_driver.Conn) -> errors.Error {
+    pCloses = pCloses + 1
+    return errors.New("")
+}
+fn pOpen(info: dbx_dsn.ConnInfo) -> (dbx_driver.Conn, errors.Error) {
+    pOpens = pOpens + 1
+    return dbx_driver.Conn{
+        Name: "poolfake",
+        queryFn: pQuery, execFn: pExec, pingFn: pPing,
+        beginFn: pBegin, closeFn: pClose
+    }, errors.New("")
+}
+
+// TestAcquireRelease verifies conns are recycled instead of reopened.
+pub fn TestAcquireRelease() {
+    dbx_driver.RegisterDriver(dbx_driver.Driver{Name: "poolfake", Open: pOpen})
+    p, err := dbx_pool.OpenPool("poolfake://h/d", 4)
+    testing.AssertEqualString("", err.message, "pool opened")
+    c1, e1 := p.Acquire()
+    testing.AssertEqualString("", e1.message, "first acquire")
+    p.Release(c1)
+    testing.AssertEqualInt(1, p.Idle(), "one idle")
+    c2, e2 := p.Acquire()
+    testing.AssertEqualString("", e2.message, "second acquire")
+    p.Release(c2)
+    testing.AssertEqualInt(1, pOpens, "conn was recycled, not reopened")
+    p.Close()
+    testing.AssertTrue(pCloses >= 1, "idle conn closed at pool close")
+}
+
+// TestMaxOpenBlocks verifies the pool caps concurrency: with max=1 the
+// second acquire blocks until the first conn is released. A spawned
+// helper releases after a short delay.
+pub fn TestMaxOpenBlocks() {
+    p, err := dbx_pool.OpenPool("poolfake://h/d", 1)
+    testing.AssertEqualString("", err.message, "pool opened")
+    c1, _ := p.Acquire()
+    done := sync.NewMutex()
+    done.Lock() // held until the spawned releaser finishes
+    spawn releaseAfter(&p, &c1, done)
+    c2, e2 := p.Acquire() // must block until releaseAfter releases c1
+    testing.AssertEqualString("", e2.message, "second acquire succeeded")
+    p.Release(c2)
+    done.Lock() // join the releaser
+    done.Unlock()
+    p.Close()
+}
+
+// releaseAfter sleeps briefly then releases the conn — proves Acquire
+// wakes the blocked waiter via the condition variable.
+fn releaseAfter(p: *dbx_pool.Pool, c: *dbx_driver.Conn, done: *sync.Mutex) {
+    time.SleepMs(150)
+    p.Release(*c)
+    done.Unlock()
+}
+
+// TestReleaseBadFreesSlot: discarding a conn lets Acquire open anew.
+pub fn TestReleaseBadFreesSlot() {
+    p, err := dbx_pool.OpenPool("poolfake://h/d", 1)
+    testing.AssertEqualString("", err.message, "pool opened")
+    c1, _ := p.Acquire()
+    before := pOpens
+    p.ReleaseBad(c1)
+    c2, e2 := p.Acquire() // must not block — slot freed
+    testing.AssertEqualString("", e2.message, "acquire after bad release")
+    testing.AssertTrue(pOpens > before, "replacement conn opened")
+    p.Release(c2)
+    p.Close()
+}
+
+// TestClosedPoolRejectsAcquire.
+pub fn TestClosedPoolRejectsAcquire() {
+    p, err := dbx_pool.OpenPool("poolfake://h/d", 2)
+    testing.AssertEqualString("", err.message, "pool opened")
+    p.Close()
+    _, e := p.Acquire()
+    testing.AssertTrue(str.Len(e.message) > 0, "acquire on closed pool fails")
+}
+

@@ -1,0 +1,154 @@
+// File:    pool.skink
+// Purpose: Bounded connection pool for dbx drivers. Acquire returns an
+//          idle Conn when one is free, opens a new one below the
+//          max-open limit, and blocks on a condition variable when the
+//          pool is exhausted. Release returns a Conn to the idle list;
+//          ReleaseBad discards a broken Conn without re-pooling it.
+module dbx_pool
+
+import "std/str"
+import "std/sync"
+import "std/errors"
+import "dbx_dsn"
+import "dbx_driver"
+
+// Pool is a thread-safe bounded set of connections for one DSN.
+pub struct Pool {
+    info:   dbx_dsn.ConnInfo
+    drv:    dbx_driver.Driver
+    max:    int
+    open:   int
+    idle:   []dbx_driver.Conn
+    mu:     *sync.Mutex
+    cond:   sync.Cond
+    closed: bool
+
+    // Acquire returns a pooled or freshly-opened connection. Blocks
+    // until a connection is available or the pool closes.
+    pub fn Acquire(self: *Pool) -> (dbx_driver.Conn, errors.Error) {
+        self.mu.Lock()
+        for {
+            if self.closed {
+                self.mu.Unlock()
+                return dbx_driver.Conn{}, errors.New("dbx: pool closed")
+            }
+            if len(self.idle) > 0 {
+                c := self.idle[len(self.idle) - 1]
+                var kept []dbx_driver.Conn
+                for i := 0; i < len(self.idle) - 1; i = i + 1 {
+                    kept = append(kept, self.idle[i])
+                }
+                self.idle = kept
+                self.mu.Unlock()
+                return c, errors.New("")
+            }
+            if self.open < self.max {
+                self.open = self.open + 1
+                self.mu.Unlock()
+                c, err := self.drv.Open(self.info)
+                if str.Len(err.message) > 0 {
+                    // Open failed — return the slot so other waiters
+                    // can make progress.
+                    self.mu.Lock()
+                    self.open = self.open - 1
+                    self.cond.Signal()
+                    self.mu.Unlock()
+                    return c, err
+                }
+                return c, errors.New("")
+            }
+            self.cond.Wait()
+        }
+        return dbx_driver.Conn{}, errors.New("unreachable")
+    }
+
+    // Release returns a connection to the pool. Connections to a closed
+    // pool are closed immediately instead.
+    pub fn Release(self: *Pool, c: dbx_driver.Conn) {
+        self.mu.Lock()
+        if self.closed {
+            self.open = self.open - 1
+            self.mu.Unlock()
+            c.Close()
+            return
+        }
+        self.idle = append(self.idle, c)
+        self.mu.Unlock()
+        self.cond.Signal()
+    }
+
+    // ReleaseBad discards a connection suspected to be broken (the
+    // caller detected a protocol or socket error). The slot is freed so
+    // Acquire can open a replacement.
+    pub fn ReleaseBad(self: *Pool, c: dbx_driver.Conn) {
+        self.mu.Lock()
+        self.open = self.open - 1
+        self.mu.Unlock()
+        c.Close()
+        self.cond.Signal()
+    }
+
+    // Size returns the number of currently open connections (busy+idle).
+    pub fn Size(self: *Pool) -> int {
+        self.mu.Lock()
+        n := self.open
+        self.mu.Unlock()
+        return n
+    }
+
+    // Idle returns the number of pooled-but-idle connections.
+    pub fn Idle(self: *Pool) -> int {
+        self.mu.Lock()
+        n := len(self.idle)
+        self.mu.Unlock()
+        return n
+    }
+
+    // Close shuts the pool: idle connections are closed now and no new
+    // Acquires succeed. Checked-out connections are closed on Release.
+    pub fn Close(self: *Pool) {
+        self.mu.Lock()
+        if self.closed {
+            self.mu.Unlock()
+            return
+        }
+        self.closed = true
+        for i := 0; i < len(self.idle); i = i + 1 {
+            self.idle[i].Close()
+        }
+        var empty []dbx_driver.Conn
+        self.idle = empty
+        self.open = 0
+        self.mu.Unlock()
+        self.cond.Broadcast()
+    }
+}
+
+// OpenPool creates a pool for a DSN. maxOpen bounds simultaneously open
+// connections (values <= 0 mean 4). Returns an error when the scheme has
+// no registered driver.
+pub fn OpenPool(dsn: string, maxOpen: int) -> (Pool, errors.Error) {
+    info, err := dbx_dsn.ParseDSN(dsn)
+    if str.Len(err.message) > 0 {
+        return Pool{}, err
+    }
+    scheme := info.Scheme
+    if str.Equal(scheme, "postgresql") {
+        scheme = "postgres"
+    } else if str.Equal(scheme, "mariadb") {
+        scheme = "mysql"
+    } else if str.Equal(scheme, "sqlserver") {
+        scheme = "mssql"
+    } else if str.Equal(scheme, "rediss") {
+        scheme = "redis"
+    }
+    drv, ok := dbx_driver.LookupDriver(scheme)
+    if !ok {
+        return Pool{}, errors.New(str.Concat("dbx: no driver registered for scheme ", info.Scheme))
+    }
+    if maxOpen <= 0 {
+        maxOpen = 4
+    }
+    mu := sync.NewMutex()
+    return Pool{info: info, drv: drv, max: maxOpen, mu: mu, cond: sync.NewCond(mu)}, errors.New("")
+}

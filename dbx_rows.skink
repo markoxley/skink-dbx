@@ -1,0 +1,110 @@
+// File:    rows.skink
+// Purpose: Eager result-set model for dbx drivers. Because Skink has no
+//          interfaces or generics, drivers materialize each result into
+//          Rows (column names + [][]Value) and callers iterate with
+//          Next/Get/ByName. Keeping results eager also frees drivers
+//          from tracking wire-protocol cursor lifetimes — cursors that
+//          do exist (MongoDB, MSSQL) are fully drained before returning.
+module dbx_rows
+
+import "std/str"
+import "dbx_value"
+
+// Rows is a materialized result set.
+pub struct Rows {
+    Columns: []string            // column names in wire order
+    Data:    [][]dbx_value.Value // one []Value per row
+    pos:     int                 // cursor: -1 before first row
+
+    // Next advances the cursor; returns false past the last row.
+    pub fn Next(self: *Rows) -> bool {
+        if self.pos < len(self.Data) {
+            self.pos = self.pos + 1
+        }
+        return self.pos < len(self.Data)
+    }
+
+    // Count returns the total number of rows.
+    pub fn Count(self: *Rows) -> int {
+        return len(self.Data)
+    }
+
+    // Reset rewinds the cursor to before the first row.
+    pub fn Reset(self: *Rows) {
+        self.pos = -1
+    }
+
+    // Row returns the current row's values (call after Next).
+    pub fn Row(self: *Rows) -> []dbx_value.Value {
+        if self.pos < 0 || self.pos >= len(self.Data) {
+            var empty []dbx_value.Value
+            return empty
+        }
+        return self.Data[self.pos]
+    }
+
+    // Get returns column i of the current row.
+    pub fn Get(self: *Rows, i: int) -> dbx_value.Value {
+        if self.pos < 0 || self.pos >= len(self.Data) {
+            return dbx_value.Null()
+        }
+        if i < 0 || i >= len(self.Data[self.pos]) {
+            return dbx_value.Null()
+        }
+        return self.Data[self.pos][i]
+    }
+
+    // ColumnIndex resolves a column name to its index, or -1.
+    pub fn ColumnIndex(self: *Rows, name: string) -> int {
+        for i := 0; i < len(self.Columns); i = i + 1 {
+            if str.Equal(self.Columns[i], name) {
+                return i
+            }
+        }
+        return -1
+    }
+
+    // ByName returns the current row's value for a named column.
+    pub fn ByName(self: *Rows, name: string) -> (dbx_value.Value, bool) {
+        i := self.ColumnIndex(name)
+        if i < 0 {
+            return dbx_value.Null(), false
+        }
+        return self.Get(i), true
+    }
+
+    // Int64 is ByName + AsInt64 convenience for the current row.
+    pub fn Int64(self: *Rows, name: string) -> int64 {
+        v, ok := self.ByName(name)
+        if !ok {
+            return 0
+        }
+        return dbx_value.AsInt64(v)
+    }
+
+    // String is ByName + AsString convenience for the current row.
+    pub fn String(self: *Rows, name: string) -> string {
+        v, ok := self.ByName(name)
+        if !ok {
+            return ""
+        }
+        return dbx_value.AsString(v)
+    }
+
+    // Close releases the result set (results are eager, so this only
+    // invalidates the cursor — kept for driver symmetry).
+    pub fn Close(self: *Rows) {
+        self.pos = len(self.Data)
+    }
+}
+
+// NewRows constructs a Rows from column names and row data.
+pub fn NewRows(columns: []string, data: [][]dbx_value.Value) -> Rows {
+    return Rows{Columns: columns, Data: data, pos: -1}
+}
+
+// EmptyRows constructs a Rows with columns but no data.
+pub fn EmptyRows(columns: []string) -> Rows {
+    var data [][]dbx_value.Value
+    return Rows{Columns: columns, Data: data, pos: -1}
+}

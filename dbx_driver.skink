@@ -1,0 +1,157 @@
+// File:    driver.skink
+// Purpose: The dbx driver abstraction. Skink has no interfaces, so the
+//          abstraction is expressed as function-valued struct fields —
+//          each driver constructs a Conn (and Tx) whose fields hold the
+//          driver's operations over an opaque State pointer. Callers use
+//          the uniform methods (Query/Exec/Ping/Begin/Close) regardless
+//          of wire protocol.
+//
+//          Drivers register themselves under a DSN scheme with
+//          RegisterDriver, typically from their package init or an
+//          exported Register function the caller invokes; Open parses a
+//          DSN and dispatches through the registry.
+module dbx_driver
+
+import "std/str"
+import "std/errors"
+import "dbx_dsn"
+import "dbx_value"
+import "dbx_rows"
+
+// Conn is one physical database connection. The fn fields are the
+// driver's implementation; State is an opaque driver pointer (cast to
+// int64). Methods delegate to the fn fields so callers never touch them.
+pub struct Conn {
+    Name:  string // driver name that produced this connection
+    State: int64  // opaque driver connection handle
+    InTx:  bool   // true while this Conn is transaction-bound
+
+    queryFn: fn(*Conn, string, []dbx_value.Value) -> (dbx_rows.Rows, errors.Error)
+    execFn:  fn(*Conn, string, []dbx_value.Value) -> (int64, errors.Error)
+    pingFn:  fn(*Conn) -> errors.Error
+    beginFn: fn(*Conn) -> (Tx, errors.Error)
+    closeFn: fn(*Conn) -> errors.Error
+
+    // Query runs a query returning rows. args may be empty.
+    pub fn Query(self: *Conn, sql: string, args: []dbx_value.Value) -> (dbx_rows.Rows, errors.Error) {
+        return self.queryFn(self, sql, args)
+    }
+
+    // Exec runs a statement and returns affected rows (best-effort;
+    // drivers without a count return 0).
+    pub fn Exec(self: *Conn, sql: string, args: []dbx_value.Value) -> (int64, errors.Error) {
+        return self.execFn(self, sql, args)
+    }
+
+    // Ping verifies the connection is alive.
+    pub fn Ping(self: *Conn) -> errors.Error {
+        return self.pingFn(self)
+    }
+
+    // Begin starts a transaction bound to this connection.
+    pub fn Begin(self: *Conn) -> (Tx, errors.Error) {
+        return self.beginFn(self)
+    }
+
+    // Close releases the connection and its socket.
+    pub fn Close(self: *Conn) -> errors.Error {
+        return self.closeFn(self)
+    }
+}
+
+// Tx is a transaction bound to a Conn. Commit/Rollback end it; calling
+// either twice is an error.
+pub struct Tx {
+    State: int64 // opaque driver transaction handle
+    done:  bool
+
+    queryFn:    fn(*Tx, string, []dbx_value.Value) -> (dbx_rows.Rows, errors.Error)
+    execFn:     fn(*Tx, string, []dbx_value.Value) -> (int64, errors.Error)
+    commitFn:   fn(*Tx) -> errors.Error
+    rollbackFn: fn(*Tx) -> errors.Error
+
+    // Query runs a query inside the transaction.
+    pub fn Query(self: *Tx, sql: string, args: []dbx_value.Value) -> (dbx_rows.Rows, errors.Error) {
+        return self.queryFn(self, sql, args)
+    }
+
+    // Exec runs a statement inside the transaction.
+    pub fn Exec(self: *Tx, sql: string, args: []dbx_value.Value) -> (int64, errors.Error) {
+        return self.execFn(self, sql, args)
+    }
+
+    // Commit commits the transaction.
+    pub fn Commit(self: *Tx) -> errors.Error {
+        if self.done {
+            return errors.New("tx already finished")
+        }
+        self.done = true
+        return self.commitFn(self)
+    }
+
+    // Rollback aborts the transaction.
+    pub fn Rollback(self: *Tx) -> errors.Error {
+        if self.done {
+            return errors.New("tx already finished")
+        }
+        self.done = true
+        return self.rollbackFn(self)
+    }
+}
+
+// Driver opens Conns for one DSN scheme (e.g. "postgres").
+pub struct Driver {
+    Name: string // DSN scheme this driver handles
+    Open: fn(dbx_dsn.ConnInfo) -> (Conn, errors.Error)
+}
+
+// registry is a linear-scan driver list — driver counts are tiny and a
+// slice avoids generic-erasure edge cases in map[string]Driver.
+var registry []Driver
+
+// RegisterDriver makes a driver available under Driver.Name. Registering
+// the same name twice replaces the earlier driver.
+pub fn RegisterDriver(d: Driver) {
+    for i := 0; i < len(registry); i = i + 1 {
+        if str.Equal(registry[i].Name, d.Name) {
+            registry[i] = d
+            return
+        }
+    }
+    registry = append(registry, d)
+}
+
+// LookupDriver returns the registered driver for a DSN scheme.
+pub fn LookupDriver(name: string) -> (Driver, bool) {
+    for i := 0; i < len(registry); i = i + 1 {
+        if str.Equal(registry[i].Name, name) {
+            return registry[i], true
+        }
+    }
+    return Driver{}, false
+}
+
+// Open parses a DSN and opens a connection through the driver registered
+// for its scheme. Aliases ("postgresql", "mariadb", "sqlserver",
+// "rediss") are normalised to their canonical scheme first.
+pub fn Open(dsn: string) -> (Conn, errors.Error) {
+    info, err := dbx_dsn.ParseDSN(dsn)
+    if str.Len(err.message) > 0 {
+        return Conn{}, err
+    }
+    scheme := info.Scheme
+    if str.Equal(scheme, "postgresql") {
+        scheme = "postgres"
+    } else if str.Equal(scheme, "mariadb") {
+        scheme = "mysql"
+    } else if str.Equal(scheme, "sqlserver") {
+        scheme = "mssql"
+    } else if str.Equal(scheme, "rediss") {
+        scheme = "redis" // TLS flag comes from the scheme; drivers read info.Scheme
+    }
+    drv, ok := LookupDriver(scheme)
+    if !ok {
+        return Conn{}, errors.New(str.Concat("dbx: no driver registered for scheme ", info.Scheme))
+    }
+    return drv.Open(info)
+}

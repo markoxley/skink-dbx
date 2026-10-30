@@ -1,0 +1,86 @@
+// File:    dsn_test.skink
+// Purpose: Unit tests for dbx_dsn — DSN/URL parsing, percent-decoding,
+//          userinfo/host/database/query splitting, IPv6 literals, port
+//          validation, and error cases.
+module dsn_test
+
+import "dbx_dsn"
+import "std/str"
+import "std/testing"
+
+// TestParsePostgres covers the canonical full-form DSN.
+pub fn TestParsePostgres() {
+    info, err := dbx_dsn.ParseDSN("postgres://alice:s3cret@db.internal:5433/shop?sslmode=require&x=1")
+    testing.AssertEqualString("", err.message, "parse ok")
+    testing.AssertEqualString("postgres", info.Scheme, "scheme")
+    testing.AssertEqualString("alice", info.User, "user")
+    testing.AssertEqualString("s3cret", info.Password, "password")
+    testing.AssertEqualString("db.internal", info.Host, "host")
+    testing.AssertEqualInt(5433, info.Port, "port")
+    testing.AssertEqualString("shop", info.Database, "database")
+    v, ok := info.Params["sslmode"]
+    testing.AssertTrue(ok, "sslmode param present")
+    testing.AssertEqualString("require", v, "sslmode value")
+    v2, ok2 := info.Params["x"]
+    testing.AssertTrue(ok2, "x param present")
+    testing.AssertEqualString("1", v2, "x value")
+}
+
+// TestParseMinimal covers host-only DSNs with defaults.
+pub fn TestParseMinimal() {
+    info, err := dbx_dsn.ParseDSN("redis://cachebox")
+    testing.AssertEqualString("", err.message, "parse ok")
+    testing.AssertEqualString("redis", info.Scheme, "scheme")
+    testing.AssertEqualString("cachebox", info.Host, "host")
+    testing.AssertEqualInt(0, info.Port, "unset port")
+    testing.AssertEqualInt(6379, dbx_dsn.PortOr(info, 6379), "PortOr fallback")
+    testing.AssertEqualString("", info.User, "no user")
+    testing.AssertEqualString("", info.Database, "no database")
+}
+
+// TestParsePercentEncoding covers %XX decoding in credentials.
+pub fn TestParsePercentEncoding() {
+    info, err := dbx_dsn.ParseDSN("mysql://u%40x:p%3Ass%25@h/db%2Fname")
+    testing.AssertEqualString("", err.message, "parse ok")
+    testing.AssertEqualString("u@x", info.User, "decoded user")
+    testing.AssertEqualString("p:ss%", info.Password, "decoded password")
+    testing.AssertEqualString("db/name", info.Database, "decoded database")
+}
+
+// TestParsePasswordWithAt verifies the last-@ rule for userinfo.
+pub fn TestParsePasswordWithAt() {
+    info, err := dbx_dsn.ParseDSN("postgres://u:p@ss@host:5432/d")
+    testing.AssertEqualString("", err.message, "parse ok")
+    testing.AssertEqualString("u", info.User, "user")
+    testing.AssertEqualString("p@ss", info.Password, "password containing @")
+    testing.AssertEqualString("host", info.Host, "host")
+}
+
+// TestParseIPv6 covers bracketed literals.
+pub fn TestParseIPv6() {
+    info, err := dbx_dsn.ParseDSN("postgres://u@[::1]:5433/d")
+    testing.AssertEqualString("", err.message, "parse ok")
+    testing.AssertEqualString("::1", info.Host, "ipv6 host")
+    testing.AssertEqualInt(5433, info.Port, "ipv6 port")
+}
+
+// TestParseNoScheme and bad ports must produce errors.
+pub fn TestParseErrors() {
+    _, err := dbx_dsn.ParseDSN("just-a-string")
+    testing.AssertTrue(str.Len(err.message) > 0, "missing scheme rejected")
+    _, err2 := dbx_dsn.ParseDSN("postgres://h:notaport/d")
+    testing.AssertTrue(str.Len(err2.message) > 0, "non-numeric port rejected")
+    _, err3 := dbx_dsn.ParseDSN("postgres://h:99999/d")
+    testing.AssertTrue(str.Len(err3.message) > 0, "out-of-range port rejected")
+    _, err4 := dbx_dsn.ParseDSN("mongodb+srv://h/d")
+    testing.AssertTrue(str.Len(err4.message) > 0, "mongodb+srv rejected")
+}
+
+// TestQueryParams covers multiple params and '+'-as-space decoding.
+pub fn TestQueryParams() {
+    info, err := dbx_dsn.ParseDSN("mssql://u@h/d?encrypt=strict&app=My+App")
+    testing.AssertEqualString("", err.message, "parse ok")
+    testing.AssertEqualString("strict", dbx_dsn.ParamOr(info, "encrypt", ""), "encrypt param")
+    testing.AssertEqualString("My App", dbx_dsn.ParamOr(info, "app", ""), "plus becomes space")
+    testing.AssertEqualString("x", dbx_dsn.ParamOr(info, "missing", "x"), "ParamOr fallback")
+}

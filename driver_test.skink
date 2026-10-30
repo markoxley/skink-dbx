@@ -1,0 +1,139 @@
+// File:    driver_test.skink
+// Purpose: Unit tests for dbx_driver — the fn-vtable Conn/Tx/Driver
+//          model, the scheme registry, and the Open dispatch including
+//          scheme aliases and unknown-scheme errors. Uses an in-memory
+//          fake driver so no real database is needed.
+module driver_test
+
+import "dbx_driver"
+import "dbx_dsn"
+import "dbx_value"
+import "dbx_rows"
+import "std/str"
+import "std/testing"
+
+var fakeOpens = 0
+
+// fakeQuery/fakeExec/fakePing/fakeBegin/fakeClose implement a fake
+// driver that returns canned results — enough to prove the vtable
+// dispatch and the DSN plumbing end to end.
+fn fakeQuery(c: *dbx_driver.Conn, sql: string, args: []dbx_value.Value) -> (dbx_rows.Rows, errors.Error) {
+    var cols []string
+    cols = append(cols, "answer")
+    var data [][]dbx_value.Value
+    var row []dbx_value.Value
+    row = append(row, dbx_value.Int(42))
+    data = append(data, row)
+    return dbx_rows.NewRows(cols, data), errors.New("")
+}
+
+fn fakeExec(c: *dbx_driver.Conn, sql: string, args: []dbx_value.Value) -> (int64, errors.Error) {
+    return 3, errors.New("")
+}
+
+fn fakePing(c: *dbx_driver.Conn) -> errors.Error {
+    return errors.New("")
+}
+
+fn fakeTxQuery(t: *dbx_driver.Tx, sql: string, args: []dbx_value.Value) -> (dbx_rows.Rows, errors.Error) {
+    return dbx_rows.EmptyRows([]string{}), errors.New("")
+}
+
+fn fakeTxExec(t: *dbx_driver.Tx, sql: string, args: []dbx_value.Value) -> (int64, errors.Error) {
+    return 0, errors.New("")
+}
+
+fn fakeTxCommit(t: *dbx_driver.Tx) -> errors.Error {
+    return errors.New("")
+}
+
+fn fakeTxRollback(t: *dbx_driver.Tx) -> errors.Error {
+    return errors.New("")
+}
+
+fn fakeBegin(c: *dbx_driver.Conn) -> (dbx_driver.Tx, errors.Error) {
+    return dbx_driver.Tx{
+        queryFn: fakeTxQuery, execFn: fakeTxExec,
+        commitFn: fakeTxCommit, rollbackFn: fakeTxRollback
+    }, errors.New("")
+}
+
+var fakeClosed = 0
+
+fn fakeClose(c: *dbx_driver.Conn) -> errors.Error {
+    fakeClosed = fakeClosed + 1
+    return errors.New("")
+}
+
+fn fakeOpen(info: dbx_dsn.ConnInfo) -> (dbx_driver.Conn, errors.Error) {
+    fakeOpens = fakeOpens + 1
+    return dbx_driver.Conn{
+        Name: "fake",
+        State: 0,
+        queryFn: fakeQuery, execFn: fakeExec, pingFn: fakePing,
+        beginFn: fakeBegin, closeFn: fakeClose
+    }, errors.New("")
+}
+
+import "std/errors"
+
+// TestRegisterAndOpen proves scheme registration and DSN dispatch.
+pub fn TestRegisterAndOpen() {
+    dbx_driver.RegisterDriver(dbx_driver.Driver{Name: "fake", Open: fakeOpen})
+    drv, ok := dbx_driver.LookupDriver("fake")
+    testing.AssertTrue(ok, "driver registered")
+    testing.AssertEqualString("fake", drv.Name, "driver name")
+    c, err := dbx_driver.Open("fake://u:p@h:123/db")
+    testing.AssertEqualString("", err.message, "open ok")
+    testing.AssertEqualInt(1, fakeOpens, "driver Open called once")
+    testing.AssertEqualString("fake", c.Name, "conn carries driver name")
+    err2 := c.Ping()
+    testing.AssertEqualString("", err2.message, "ping ok")
+    c.Close()
+    testing.AssertEqualInt(1, fakeClosed, "close dispatched")
+}
+
+// TestQueryExecDispatch runs canned results through the vtable.
+pub fn TestQueryExecDispatch() {
+    c, err := dbx_driver.Open("fake://h/d")
+    testing.AssertEqualString("", err.message, "open ok")
+    var args []dbx_value.Value
+    args = append(args, dbx_value.Int(1))
+    rows, qerr := c.Query("select 1", args)
+    testing.AssertEqualString("", qerr.message, "query ok")
+    testing.AssertTrue(rows.Next(), "one row")
+    testing.AssertTrue(rows.Int64("answer") == 42, "canned value")
+    n, eerr := c.Exec("update t", args)
+    testing.AssertEqualString("", eerr.message, "exec ok")
+    testing.AssertTrue(n == 3, "affected rows")
+}
+
+// TestTx covers Begin/Commit and double-finish errors.
+pub fn TestTx() {
+    c, _ := dbx_driver.Open("fake://h/d")
+    tx, berr := c.Begin()
+    testing.AssertEqualString("", berr.message, "begin ok")
+    var args []dbx_value.Value
+    tx.Exec("insert", args)
+    cerr := tx.Commit()
+    testing.AssertEqualString("", cerr.message, "commit ok")
+    cerr2 := tx.Commit()
+    testing.AssertTrue(str.Len(cerr2.message) > 0, "double commit rejected")
+    tx2, _ := c.Begin()
+    rerr := tx2.Rollback()
+    testing.AssertEqualString("", rerr.message, "rollback ok")
+}
+
+// TestUnknownScheme and alias handling.
+pub fn TestSchemeAliases() {
+    _, err := dbx_driver.Open("nosuch://h/d")
+    testing.AssertTrue(str.Contains(err.message, "no driver"), "unknown scheme error")
+    dbx_driver.RegisterDriver(dbx_driver.Driver{Name: "postgres", Open: fakeOpen})
+    c, err2 := dbx_driver.Open("postgresql://h/d")
+    testing.AssertEqualString("", err2.message, "postgresql alias resolves")
+    c.Close()
+    dbx_driver.RegisterDriver(dbx_driver.Driver{Name: "mysql", Open: fakeOpen})
+    c2, err3 := dbx_driver.Open("mariadb://h/d")
+    testing.AssertEqualString("", err3.message, "mariadb alias resolves")
+    c2.Close()
+}

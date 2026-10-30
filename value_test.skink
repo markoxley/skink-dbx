@@ -1,0 +1,55 @@
+// File:    value_test.skink
+// Purpose: Unit tests for dbx_value — the tagged-union Value model and
+//          its constructors/coercions, including binary-safe blob
+//          handling with embedded NUL bytes.
+module value_test
+
+import "dbx_value"
+import "std/str"
+import "std/libc"
+import "std/testing"
+
+// TestConstructors covers each KIND_* constructor.
+pub fn TestConstructors() {
+    testing.AssertTrue(dbx_value.IsNull(dbx_value.Null()), "null kind")
+    testing.AssertEqualInt(1, dbx_value.Int(1).Kind, "int kind")
+    testing.AssertTrue(dbx_value.Int(42).I64 == 42, "int payload")
+    testing.AssertEqualInt(2, dbx_value.Float(1.5).Kind, "float kind")
+    testing.AssertEqualInt(3, dbx_value.Text("hi").Kind, "text kind")
+    testing.AssertEqualInt(5, dbx_value.Bool(true).Kind, "bool kind")
+    testing.AssertTrue(dbx_value.Bool(true).Bool, "bool payload")
+    testing.AssertEqualInt(6, dbx_value.TimeUnixMicros(7).Kind, "time kind")
+}
+
+// TestAsString renders each kind as text.
+pub fn TestAsString() {
+    testing.AssertEqualString("NULL", dbx_value.AsString(dbx_value.Null()), "null renders")
+    testing.AssertEqualString("42", dbx_value.AsString(dbx_value.Int(42)), "int renders")
+    testing.AssertEqualString("true", dbx_value.AsString(dbx_value.Bool(true)), "bool renders")
+    testing.AssertEqualString("hello", dbx_value.AsString(dbx_value.Text("hello")), "text renders")
+    // A blob containing a NUL must come back at its explicit length —
+    // this guards the binary-safe dupLen path (strlen would truncate).
+    raw := libc.malloc(4)
+    raw[0] = 65 // 'A'
+    raw[1] = 0
+    raw[2] = 66 // 'B'
+    raw[3] = 0
+    v := dbx_value.Blob(raw, 3)
+    s := dbx_value.AsString(v)
+    testing.AssertTrue(s[0] == 65 && s[2] == 66, "blob bytes preserved around NUL")
+    libc.free(raw)
+}
+
+// TestAsInt64 and friends cover coercions.
+pub fn TestCoercions() {
+    testing.AssertTrue(dbx_value.AsInt64(dbx_value.Text("7")) == 7, "text->int")
+    testing.AssertTrue(dbx_value.AsInt64(dbx_value.Bool(true)) == 1, "bool->int")
+    testing.AssertTrue(dbx_value.AsInt64(dbx_value.Float(3.9)) == 3, "float->int truncates")
+    testing.AssertTrue(dbx_value.AsBool(dbx_value.Int(1)), "int->bool")
+    testing.AssertTrue(dbx_value.AsBool(dbx_value.Text("yes")), "text->bool")
+    testing.AssertTrue(!dbx_value.AsBool(dbx_value.Text("no")), "text->bool false")
+    f := dbx_value.AsFloat(dbx_value.Int(5))
+    testing.AssertTrue(f > 4.9 && f < 5.1, "int->float")
+    f2 := dbx_value.AsFloat(dbx_value.Text("2.5"))
+    testing.AssertTrue(f2 > 2.4 && f2 < 2.6, "text->float")
+}
