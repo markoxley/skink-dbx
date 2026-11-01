@@ -14,6 +14,12 @@ import "std/libc"
 import "std/net"
 import "std/errors"
 
+// Raw byte accessors for malloc'd binary buffers — string indexing is
+// bounds-checked against strlen, which truncates at the first NUL byte.
+extern fn Skink_mem_byte(ptr: string, idx: int64) -> int
+extern fn Skink_mem_write_byte(ptr: string, idx: int64, val: int)
+
+
 // TLS client primitives — same externs std/api uses.
 extern fn Skink_tls_client_connect_ex(fd: int, hostname: string, port: int, verify: int) -> int64
 extern fn Skink_tls_read(ssl: int64, buf: string, len: int) -> int
@@ -109,7 +115,7 @@ pub struct BufConn {
         }
         out := libc.malloc(n + 1)
         libc.memcpy(out, self.pend, n)
-        out[n] = 0
+        Skink_mem_write_byte(out, int64(n), 0)
         // Consume by memmove so the staging buffer stays prefix-packed.
         rest := self.pendLen - n
         if rest > 0 {
@@ -130,7 +136,7 @@ pub struct BufConn {
         }
         out := libc.malloc(n + 1)
         libc.memcpy(out, self.pend, n)
-        out[n] = 0
+        Skink_mem_write_byte(out, int64(n), 0)
         return out, errors.New("")
     }
 
@@ -173,7 +179,7 @@ pub struct BufConn {
                 if found > 0 {
                     libc.memcpy(out, self.pend, found)
                 }
-                out[found] = 0
+                Skink_mem_write_byte(out, int64(found), 0)
                 rest := self.pendLen - found - 1
                 if rest > 0 {
                     memmove(self.pend, string(int64(self.pend) + int64(found) + 1), int64(rest))

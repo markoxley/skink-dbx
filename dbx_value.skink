@@ -15,6 +15,12 @@ import "std/str"
 import "std/strconv"
 import "std/libc"
 
+// Raw byte accessors for malloc'd binary buffers — string indexing is
+// bounds-checked against strlen, which truncates at the first NUL byte.
+extern fn Skink_mem_byte(ptr: string, idx: int64) -> int
+extern fn Skink_mem_write_byte(ptr: string, idx: int64, val: int)
+
+
 // Kind tags for Value.
 pub const KIND_NULL  = 0
 pub const KIND_INT   = 1
@@ -94,7 +100,7 @@ fn dupLen(s: string, n: int) -> string {
     if n > 0 {
         libc.memcpy(out, s, n)
     }
-    out[n] = 0
+    Skink_mem_write_byte(out, int64(n), 0)
     return out
 }
 

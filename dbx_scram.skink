@@ -20,6 +20,12 @@ import "std/rand"
 import "std/base64"
 import "std/errors"
 
+// Raw byte accessors for malloc'd binary buffers — string indexing is
+// bounds-checked against strlen, which truncates at the first NUL byte.
+extern fn Skink_mem_byte(ptr: string, idx: int64) -> int
+extern fn Skink_mem_write_byte(ptr: string, idx: int64, val: int)
+
+
 extern fn SHA1(d: string, n: int64, md: string) -> string
 extern fn SHA256(d: string, n: int64, md: string) -> string
 
@@ -61,8 +67,8 @@ fn hmac(key: string, keyLen: int, msg: string, msgLen: int, sha256: bool) -> str
     libc.memset(ipad, 54, block) // 0x36
     libc.memset(opad, 92, block) // 0x5c
     for i := 0; i < kl; i = i + 1 {
-        ipad[i] = ipad[i] ^ k[i]
-        opad[i] = opad[i] ^ k[i]
+        Skink_mem_write_byte(ipad, int64(i), Skink_mem_byte(ipad, int64(i)) ^ Skink_mem_byte(k, int64(i)))
+        Skink_mem_write_byte(opad, int64(i), Skink_mem_byte(opad, int64(i)) ^ Skink_mem_byte(k, int64(i)))
     }
     libc.memcpy(string(int64(ipad) + int64(block)), msg, msgLen)
     inner := h(ipad, block + msgLen, sha256)
@@ -78,7 +84,7 @@ fn hmac(key: string, keyLen: int, msg: string, msgLen: int, sha256: bool) -> str
 fn xorN(a: string, b: string, n: int) -> string {
     out := libc.malloc(n)
     for i := 0; i < n; i = i + 1 {
-        out[i] = a[i] ^ b[i]
+        Skink_mem_write_byte(out, int64(i), Skink_mem_byte(a, int64(i)) ^ Skink_mem_byte(b, int64(i)))
     }
     return out
 }
@@ -90,17 +96,17 @@ fn hi(password: string, salt: string, saltLen: int, iters: int, sha256: bool) ->
     dk := hLen(sha256)
     msg := libc.malloc(saltLen + 4)
     libc.memcpy(msg, salt, saltLen)
-    msg[saltLen] = 0
-    msg[saltLen + 1] = 0
-    msg[saltLen + 2] = 0
-    msg[saltLen + 3] = 1
+    Skink_mem_write_byte(msg, int64(saltLen), 0)
+    Skink_mem_write_byte(msg, int64(saltLen + 1), 0)
+    Skink_mem_write_byte(msg, int64(saltLen + 2), 0)
+    Skink_mem_write_byte(msg, int64(saltLen + 3), 1)
     u := hmac(password, str.Len(password), msg, saltLen + 4, sha256)
     t := libc.malloc(dk)
     libc.memcpy(t, u, dk)
     for i := 1; i < iters; i = i + 1 {
         next := hmac(password, str.Len(password), u, dk, sha256)
         for j := 0; j < dk; j = j + 1 {
-            t[j] = t[j] ^ next[j]
+            Skink_mem_write_byte(t, int64(j), Skink_mem_byte(t, int64(j)) ^ Skink_mem_byte(next, int64(j)))
         }
         libc.free(u)
         u = next
@@ -304,7 +310,7 @@ pub fn VerifyServerFinal(s: *Scram, msg: string) -> errors.Error {
     }
     ok := true
     for i := 0; i < dk; i = i + 1 {
-        if sig[i] != s.serverSig[i] {
+        if Skink_mem_byte(sig, int64(i)) != Skink_mem_byte(s.serverSig, int64(i)) {
             ok = false
         }
     }

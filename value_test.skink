@@ -9,6 +9,12 @@ import "std/str"
 import "std/libc"
 import "std/testing"
 
+// Raw byte accessors for the malloc'd blob fixture — string indexing is
+// bounds-checked against strlen, which truncates at the first NUL byte.
+extern fn Skink_mem_byte(ptr: string, idx: int64) -> int
+extern fn Skink_mem_write_byte(ptr: string, idx: int64, val: int)
+
+
 // TestConstructors covers each KIND_* constructor.
 pub fn TestConstructors() {
     testing.AssertTrue(dbx_value.IsNull(dbx_value.Null()), "null kind")
@@ -30,13 +36,13 @@ pub fn TestAsString() {
     // A blob containing a NUL must come back at its explicit length —
     // this guards the binary-safe dupLen path (strlen would truncate).
     raw := libc.malloc(4)
-    raw[0] = 65 // 'A'
-    raw[1] = 0
-    raw[2] = 66 // 'B'
-    raw[3] = 0
+    Skink_mem_write_byte(raw, 0, 65) // 'A'
+    Skink_mem_write_byte(raw, 1, 0)
+    Skink_mem_write_byte(raw, 2, 66) // 'B'
+    Skink_mem_write_byte(raw, 3, 0)
     v := dbx_value.Blob(raw, 3)
     s := dbx_value.AsString(v)
-    testing.AssertTrue(s[0] == 65 && s[2] == 66, "blob bytes preserved around NUL")
+    testing.AssertTrue(Skink_mem_byte(s, 0) == 65 && Skink_mem_byte(s, 2) == 66, "blob bytes preserved around NUL")
     libc.free(raw)
 }
 

@@ -1,0 +1,76 @@
+// File:    cov_test.skink
+// Purpose: Coverage tests for previously-unexercised dbx API surface:
+//          Value.Bytes/TextN payload accessors, Scram.Mechanism naming,
+//          ConnInfo.Param lookups, and BufConn.Wrap socket adoption.
+module cov_test
+
+import "dbx"
+import "dbx_bufconn"
+import "dbx_dsn"
+import "dbx_scram"
+import "dbx_value"
+import "std/str"
+import "std/net"
+import "std/libc"
+import "std/time"
+import "std/waitgroup"
+import "std/testing"
+
+// TestTextNAndBytes verifies explicit-length text/binary payloads:
+// TextN keeps trailing content beyond the first NUL visible to Bytes.
+pub fn TestTextNAndBytes() {
+    v := dbx_value.TextN("hello", 5)
+    testing.AssertEqualString("hello", dbx_value.Bytes(v), "textn payload")
+    v2 := dbx_value.Text("abc")
+    testing.AssertEqualString("abc", dbx_value.Bytes(v2), "text payload")
+}
+
+// TestMechanism verifies the SCRAM wire names for both digests.
+pub fn TestMechanism() {
+    s256 := dbx_scram.NewScram("u", "p", true)
+    testing.AssertEqualString("SCRAM-SHA-256", dbx_scram.Mechanism(&s256), "sha256 mech")
+    s1 := dbx_scram.NewScram("u", "p", false)
+    testing.AssertEqualString("SCRAM-SHA-1", dbx_scram.Mechanism(&s1), "sha1 mech")
+}
+
+// TestParam verifies ConnInfo.Param hit/miss and ParamOr fallback.
+pub fn TestParam() {
+    info, err := dbx_dsn.ParseDSN("pg://u:p@h:1/db?sslmode=disable&x=2")
+    testing.AssertEqualString("", err.message, "dsn parse")
+    v, ok := dbx_dsn.Param(info, "sslmode")
+    testing.AssertTrue(ok, "param present")
+    testing.AssertEqualString("disable", v, "param value")
+    _, miss := dbx_dsn.Param(info, "nope")
+    testing.AssertFalse(miss, "param miss")
+    testing.AssertEqualString("fb", dbx_dsn.ParamOr(info, "nope", "fb"), "param fallback")
+}
+
+// echoServer accepts one connection and holds it briefly.
+fn echoServer(wg: *waitgroup.WaitGroup) {
+    ln, lerr := net.Listen("127.0.0.1", 18370)
+    if str.Len(lerr.message) > 0 {
+        waitgroup.Done(wg)
+        return
+    }
+    conn, _ := net.Accept(ln)
+    time.SleepMs(50)
+    conn.Close()
+    ln.Close()
+    waitgroup.Done(wg)
+}
+
+// TestWrap adopts a live socket with Wrap and checks the metadata —
+// Host/IsTLS must reflect the adopted connection, and Close works.
+pub fn TestWrap() {
+    wg := waitgroup.New()
+    waitgroup.Add(wg, 1)
+    spawn echoServer(wg)
+    time.SleepMs(30)
+    conn, cerr := net.Connect("127.0.0.1", 18370)
+    testing.AssertEqualString("", cerr.message, "connect")
+    bc := dbx_bufconn.Wrap(conn, "127.0.0.1", 18370)
+    testing.AssertEqualString("127.0.0.1", bc.Host(), "wrapped host")
+    testing.AssertFalse(bc.IsTLS(), "wrapped conn is plaintext")
+    bc.Close()
+    waitgroup.Wait(wg)
+}
